@@ -74,7 +74,7 @@ simple_ppo_model.pth         # Saved model weights
 2. **Enter a flat world** (recommended for initial training)
 3. **Run the training**:
 ```bash
-\simple_ppo_model
+\reinforcement
 ```
 
 4. **Monitor progress** via console output and CSV logs
