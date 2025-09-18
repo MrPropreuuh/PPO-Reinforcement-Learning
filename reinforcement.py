@@ -1,3 +1,4 @@
+# navigation_ppo_simplified.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -21,23 +22,26 @@ import math
 class Config:
     """Simplified project configuration"""
     # Environment settings
-    lidar_range: int = 3  # Simplified Scan  3x3x3
+    scan_radius: int = 5  # Radius for block scanning
     max_episode_steps: int = 600
     timeout_seconds: float = 30.0
 
-    # PPO hyperparameters
-    lr: float = 3e-4
+    # PPO hyperparameters - REDUCED learning rate
+    lr: float = 3e-5  # Reduced from 3e-4 to prevent explosions
     gamma: float = 0.99
     clip_epsilon: float = 0.2
-    entropy_beta: float = 0.02
+    entropy_beta: float = 0.01  # Reduced for stability
 
     # Training settings
     batch_size: int = 128
-    update_every: int = 2048
-    ppo_epochs: int = 4
+    update_every: int = 256  # More frequent updates
+    ppo_epochs: int = 3  # Reduced epochs
 
     # Network architecture
     hidden_size: int = 128
+
+    # Gradient clipping - STRICTER
+    max_grad_norm: float = 0.5  # Reduced from 1.0
 
 
 # =====================================
@@ -78,7 +82,7 @@ class CSVLogger:
             'success', 'final_distance', 'start_distance'
         ]
         self.writer.writerow(self.header)
-        print(f"[CSV] Log created : {self.filepath}")
+        print(f"[CSV] Log created: {self.filepath}")
 
     def log_episode(self, episode_data: dict):
         row = [episode_data.get(h, '') for h in self.header]
@@ -90,46 +94,114 @@ class CSVLogger:
 
 
 # =====================================
-# PPO Model
+# Block Cache System
+# =====================================
+class BlockCache:
+    """Caches block data to avoid redundant queries"""
+
+    def __init__(self, ttl=10):
+        self.cache = {}
+        self.ttl = ttl  # Time to live in steps
+        self.current_step = 0
+
+    def get_blocks(self, points):
+        """Get blocks with caching"""
+        self.current_step += 1
+
+        # Clean expired entries
+        if self.current_step % 50 == 0:
+            self._clean_expired()
+
+        uncached_points = []
+        cached_results = {}
+
+        for point in points:
+            key = tuple(point)
+            if key in self.cache:
+                entry = self.cache[key]
+                if self.current_step - entry['step'] < self.ttl:
+                    cached_results[key] = entry['block']
+                else:
+                    uncached_points.append(point)
+            else:
+                uncached_points.append(point)
+
+        # Fetch uncached blocks
+        if uncached_points:
+            try:
+                new_blocks = ms.getblocklist(uncached_points)
+                for i, point in enumerate(uncached_points):
+                    key = tuple(point)
+                    self.cache[key] = {
+                        'block': new_blocks[i],
+                        'step': self.current_step
+                    }
+                    cached_results[key] = new_blocks[i]
+            except:
+                pass
+
+        # Return blocks in original order
+        result = []
+        for point in points:
+            key = tuple(point)
+            result.append(cached_results.get(key, 'minecraft:air'))
+
+        return result
+
+    def _clean_expired(self):
+        """Remove expired entries"""
+        expired_keys = []
+        for key, entry in self.cache.items():
+            if self.current_step - entry['step'] >= self.ttl:
+                expired_keys.append(key)
+        for key in expired_keys:
+            del self.cache[key]
+
+
+# =====================================
+# PPO Model with Better Initialization
 # =====================================
 class SimplePPONetwork(nn.Module):
-    """Réseau simple mais efficace pour PPO"""
+    """Simple but effective PPO network"""
 
     def __init__(self, input_size: int, hidden_size: int):
         super().__init__()
 
-        # Shared network layers
+        # Shared network layers with LayerNorm for stability
         self.fc1 = nn.Linear(input_size, hidden_size)
+        self.ln1 = nn.LayerNorm(hidden_size)
         self.fc2 = nn.Linear(hidden_size, hidden_size)
+        self.ln2 = nn.LayerNorm(hidden_size)
 
         # Actor and Critic heads
-        self.actor_mean = nn.Linear(hidden_size, 4)  # yaw, pitch, forward, sprint
-        self.actor_log_std = nn.Parameter(torch.zeros(4) - 0.5)  # Commence avec std ~0.6
+        self.actor_mean = nn.Linear(hidden_size, 4)
+        self.actor_log_std = nn.Parameter(torch.zeros(4) - 1.0)  # Lower initial std
         self.critic = nn.Linear(hidden_size, 1)
 
-        # Initialisation des poids pour stabilité
+        # Weight initialization for stability
         self._init_weights()
 
     def _init_weights(self):
-        """Initialisation stable des poids"""
+        """Stable weight initialization"""
         for layer in [self.fc1, self.fc2]:
             nn.init.orthogonal_(layer.weight, gain=np.sqrt(2))
             nn.init.constant_(layer.bias, 0.0)
 
-        # Actor head with a smaller gain for smoother initial actions
-        nn.init.orthogonal_(self.actor_mean.weight, gain=0.01)
+        # Very small actor initialization to start with small actions
+        nn.init.orthogonal_(self.actor_mean.weight, gain=0.001)
         nn.init.constant_(self.actor_mean.bias, 0.0)
 
-        # Critic head with standard initialization
+        # Standard critic initialization
         nn.init.orthogonal_(self.critic.weight, gain=1.0)
         nn.init.constant_(self.critic.bias, 0.0)
 
     def forward(self, x):
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
+        # Forward pass with LayerNorm
+        x = F.relu(self.ln1(self.fc1(x)))
+        x = F.relu(self.ln2(self.fc2(x)))
 
         action_mean = self.actor_mean(x)
-        action_std = torch.exp(self.actor_log_std.clamp(-2, 1))
+        action_std = torch.exp(self.actor_log_std.clamp(-3, 0))  # Stricter std bounds
         value = self.critic(x)
 
         return action_mean, action_std, value
@@ -143,6 +215,9 @@ class SimplePPONetwork(nn.Module):
             dist = Normal(mean, std)
             action = dist.sample()
 
+        # Ensure action is bounded
+        action = torch.tanh(action)
+
         dist = Normal(mean, std)
         log_prob = dist.log_prob(action).sum(dim=-1)
 
@@ -150,18 +225,37 @@ class SimplePPONetwork(nn.Module):
 
 
 # =====================================
-# Minecraft Environment
+# Minecraft Environment with Hazard Detection
 # =====================================
 class SimpleNavigationEnv:
-    """A minimalist environment focused on navigation."""
+    """Environment with hazard awareness and block caching"""
+
+    # Define hazardous blocks
+    HAZARD_BLOCKS = {
+        'minecraft:lava': -50.0,
+        'minecraft:flowing_lava': -50.0,
+        'minecraft:fire': -30.0,
+        'minecraft:magma_block': -20.0,
+        'minecraft:cactus': -10.0,
+        'minecraft:water': -2.0,
+        'minecraft:flowing_water': -2.0,
+    }
+
+    SOLID_BLOCKS = {
+        'minecraft:stone', 'minecraft:dirt', 'minecraft:grass_block',
+        'minecraft:cobblestone', 'minecraft:sand', 'minecraft:gravel',
+        'minecraft:oak_log', 'minecraft:oak_planks', 'minecraft:bedrock'
+    }
 
     def __init__(self, config: Config, logger):
         self.config = config
         self.logger = logger
+        self.block_cache = BlockCache(ttl=20)
         self.reset()
 
     def reset(self, difficulty="easy"):
         """Resets the environment for a new episode."""
+        # Clean up previous marker
         if hasattr(self, 'marker_pos'):
             try:
                 ms.execute(f"/setblock {self.marker_pos[0]} {self.marker_pos[1]} {self.marker_pos[2]} minecraft:air")
@@ -174,9 +268,9 @@ class SimpleNavigationEnv:
         if difficulty == "easy":
             distance = random.uniform(5, 10)
         elif difficulty == "medium":
-            distance = random.uniform(15, 25)
+            distance = random.uniform(10, 20)
         else:
-            distance = random.uniform(25, 40)
+            distance = random.uniform(20, 35)
 
         angle = random.uniform(0, 2 * math.pi)
         self.destination = (
@@ -185,11 +279,11 @@ class SimpleNavigationEnv:
             pos[2] + distance * math.sin(angle)
         )
 
-        # Mark destination with a glowstone block
+        # Mark destination with glowstone
         self.marker_pos = (int(self.destination[0]), int(self.destination[1]), int(self.destination[2]))
         ms.execute(f"/setblock {self.marker_pos[0]} {self.marker_pos[1]} {self.marker_pos[2]} minecraft:glowstone")
 
-        # Reset episode state variables
+        # Reset episode state
         self.start_distance = self._get_distance()
         self.best_distance = self.start_distance
         self._last_distance = self.start_distance
@@ -197,8 +291,9 @@ class SimpleNavigationEnv:
         self.start_time = time.time()
         self.stuck_count = 0
         self.reached_5m = False
+        self.cumulative_reward = 0
 
-        # Reset contrôles
+        # Reset controls
         ms.player_press_forward(False)
         ms.player_press_sprint(False)
 
@@ -207,14 +302,14 @@ class SimpleNavigationEnv:
         return self._get_state()
 
     def _get_distance(self):
-        """Calculates the 2D distance to the destination."""
+        """Calculate 2D distance to destination"""
         pos = ms.player_position()
         dx = self.destination[0] - pos[0]
         dz = self.destination[2] - pos[2]
         return math.sqrt(dx ** 2 + dz ** 2)
 
     def _get_state(self):
-        """Constructs the state vector for the agent."""
+        """Construct state vector with hazard awareness"""
         pos = ms.player_position()
         yaw, pitch = ms.player_orientation()
 
@@ -224,147 +319,151 @@ class SimpleNavigationEnv:
         distance = math.sqrt(dx ** 2 + dz ** 2)
         target_yaw = math.degrees(math.atan2(-dx, dz))
 
-        # Normalized yaw error [-1, 1]
-        yaw_error = ((target_yaw - yaw + 180) % 360 - 180) / 180.0  # Normalisé [-1, 1]
+        # Normalized yaw error
+        yaw_error = ((target_yaw - yaw + 180) % 360 - 180) / 180.0
 
-        # 90-degree LiDAR scan for obstacles
-        lidar = self._optimized_lidar_90(pos, yaw)
+        # Scan surrounding blocks for hazards
+        hazard_scan = self._scan_for_hazards(pos, yaw)
 
-        # State vector: [distance, yaw_error, pitch, time_elapsed, ...lidar]
+        # State vector
         state = [
                     min(distance / 50.0, 1.0),
                     yaw_error,
                     pitch / 90.0,
                     self.step_count / self.config.max_episode_steps,
-                ] + lidar
+                ] + hazard_scan
 
         return np.array(state, dtype=np.float32)
 
-    def _optimized_lidar_90(self, pos, yaw):
-        """A fast, minimalist 90° LiDAR using a batch block request."""
+    def _scan_for_hazards(self, pos, yaw):
+        """Scan for hazards and obstacles in front"""
+        scan_data = []
         yaw_rad = math.radians(yaw)
 
-        angles = [-30, -15, 0, 15, 30]  # 5 critical rays
-        points = []
+        # 5 forward rays at different angles
+        angles = [-30, -15, 0, 15, 30]
 
-        # For each ray, check two distances (near and far)
         for angle_deg in angles:
             angle_rad = math.radians(angle_deg)
             ray_yaw = yaw_rad + angle_rad
-            for dist in [3, 7]:
+
+            # Check multiple distances
+            hazard_level = 0.0
+            for dist in [2, 4, 6]:
                 x = int(pos[0] - math.sin(ray_yaw) * dist)
                 z = int(pos[2] + math.cos(ray_yaw) * dist)
-                y = int(pos[1])
-                points.append([x, y, z])
 
-        try:
-            blocks = ms.getblocklist(points)
-        except:
-            return [1.0] * 5  # 5 rayons
+                # Check ground and eye level
+                points_to_check = [
+                    [x, int(pos[1] - 1), z],  # Ground
+                    [x, int(pos[1]), z],  # Feet
+                    [x, int(pos[1] + 1), z]  # Head
+                ]
 
-        # Process results
-        lidar = []
-        for i in range(5):  # 5 rays
-            block_near = blocks[i * 2]
-            block_far = blocks[i * 2 + 1]
-            if block_near and block_near != 'minecraft:air':
-                lidar.append(0.3)  # Obstacle is very close
-            elif block_far and block_far != 'minecraft:air':
-                lidar.append(0.7)  # Obstacle is further away
-            else:
-                lidar.append(1.0)  # Path is clear
+                blocks = self.block_cache.get_blocks(points_to_check)
 
-        # Expand 5 rays to 9 to match network input size
+                for block in blocks:
+                    if block in self.HAZARD_BLOCKS:
+                        hazard_level = min(hazard_level, self.HAZARD_BLOCKS[block] / 50.0)
+                    elif block in self.SOLID_BLOCKS:
+                        hazard_level = min(hazard_level, -0.1)  # Minor penalty for obstacles
+
+                if hazard_level < 0:
+                    break  # Stop checking further if hazard found
+
+            scan_data.append(hazard_level)
+
+        # Expand to 9 values for network compatibility
         expanded = [
-            lidar[0], lidar[0],
-            lidar[1],
-            lidar[2], lidar[2], lidar[2],
-            lidar[3],
-            lidar[4], lidar[4]
+            scan_data[0], scan_data[0],
+            scan_data[1],
+            scan_data[2], scan_data[2], scan_data[2],
+            scan_data[3],
+            scan_data[4], scan_data[4]
         ]
 
         return expanded
 
     def step(self, action):
-        """Execute one step in the environment."""
+        """Execute one step with normalized rewards"""
         self.step_count += 1
         self._apply_action(action)
 
-        # Calculate reward based on progress
-        old_distance = self._get_distance() if hasattr(self, '_last_distance') else self.start_distance
+        # Distance calculations
+        old_distance = self._last_distance
         new_distance = self._get_distance()
 
-        # --- Reward Shaping ---
+        # NORMALIZED REWARD SYSTEM (-1 to +1 range)
         reward = 0
 
-        # 1. Progress toward target
-        progress = old_distance - new_distance
-        if progress > 0:
-            reward += progress * 15.0  # # Positive reward for getting closer
+        # 1. Progress reward (normalized)
+        progress = (old_distance - new_distance) / 10.0  # Divide by 10 for normalization
+        reward += np.clip(progress * 5.0, -1.0, 1.0)
 
-        else:
-            reward += progress * 20.0  # Stronger penalty for moving away
-
-        # 2. Orientation penalty
+        # 2. Orientation penalty (small, continuous)
         pos = ms.player_position()
-        yaw, pitch = ms.player_orientation()
+        yaw, _ = ms.player_orientation()
         dx = self.destination[0] - pos[0]
         dz = self.destination[2] - pos[2]
         target_yaw = math.degrees(math.atan2(-dx, dz))
         yaw_error = abs(((target_yaw - yaw + 180) % 360 - 180))
 
-        if yaw_error > 90: # Facing the wrong way
-            reward -= 0.5
-        elif yaw_error > 45:
-            reward -= 0.2
+        reward -= (yaw_error / 180.0) * 0.1  # Small orientation penalty
 
-        # 3. Time penalty to encourage speed
-        reward -= 0.05  # Encourage la vitesse
+        # 3. Time penalty (very small)
+        reward -= 0.01
 
         # 4. Stuck penalty
-        if abs(progress) < 0.01:  # Presque pas bougé
-            self.stuck_count = getattr(self, 'stuck_count', 0) + 1
-            if self.stuck_count > 10:
-                reward -= 1.0  # Forte pénalité si bloqué
+        if abs(progress) < 0.001:
+            self.stuck_count += 1
+            if self.stuck_count > 20:
+                reward -= 0.5
         else:
             self.stuck_count = 0
 
-        # 5. BONUS : Close
-        if new_distance < 5.0 and not hasattr(self, 'reached_5m'):
-            reward += 20.0
+        # 5. Check for hazards around player
+        hazard_penalty = self._check_hazards()
+        reward += hazard_penalty
+
+        # 6. Milestone bonus (normalized)
+        if new_distance < 5.0 and not self.reached_5m:
+            reward += 1.0
             self.reached_5m = True
-            self.logger.info(f"Close! Distance: {new_distance:.1f}m")
+            self.logger.info(f"Milestone reached! Distance: {new_distance:.1f}m")
 
-        # 6. Success bonus
+        # 7. Success bonus (normalized)
         if new_distance < 2.0:
-            reward += 100.0  # Big reward
-            self.logger.info(f"SUCCESS! Distance finale: {new_distance:.1f}m")
+            reward += 5.0  # Big but normalized reward
+            self.logger.info(f"SUCCESS! Final distance: {new_distance:.1f}m")
 
-        # LOG DEBUG
+        # IMPORTANT: Clip total reward to prevent explosions
+        reward = np.clip(reward, -2.0, 2.0)
+
+        # Track cumulative reward for stability monitoring
+        self.cumulative_reward += reward
+
+        # Debug logging
         self.logger.debug(
-            f"Step {self.step_count} | Reward: {reward:.2f} | "
-            f"Progress: {progress:.3f}m | YawError: {yaw_error:.1f}° | "
-            f"Distance: {new_distance:.1f}m | Stuck: {self.stuck_count}"
+            f"Step {self.step_count} | Reward: {reward:.3f} | "
+            f"Progress: {progress:.3f} | YawError: {yaw_error:.1f}° | "
+            f"Distance: {new_distance:.1f}m | Cumulative: {self.cumulative_reward:.2f}"
         )
 
-        # Update distances
+        # Update state tracking
         self._last_distance = new_distance
         if new_distance < self.best_distance:
             self.best_distance = new_distance
 
-        # Check if episode is done
+        # Check termination
         done = False
         if new_distance < 2.0:
             done = True
         elif self.step_count >= self.config.max_episode_steps:
             done = True
-            reward -= 10  # Pénalité timeout
         elif time.time() - self.start_time > self.config.timeout_seconds:
             done = True
-            reward -= 10
 
         state = self._get_state()
-
         info = {
             'distance': new_distance,
             'success': new_distance < 2.0
@@ -372,14 +471,32 @@ class SimpleNavigationEnv:
 
         return state, reward, done, info
 
+    def _check_hazards(self):
+        """Check for hazards at player position"""
+        pos = ms.player_position()
+        points = [
+            [int(pos[0]), int(pos[1] - 1), int(pos[2])],  # Below feet
+            [int(pos[0]), int(pos[1]), int(pos[2])]  # At feet
+        ]
+
+        blocks = self.block_cache.get_blocks(points)
+
+        penalty = 0
+        for block in blocks:
+            if block in self.HAZARD_BLOCKS:
+                penalty = self.HAZARD_BLOCKS[block] / 50.0  # Normalized penalty
+                self.logger.debug(f"Hazard detected: {block} (penalty: {penalty:.2f})")
+                break
+
+        return penalty
+
     def _apply_action(self, action):
-        """Applies the agent's action to the game."""
-        # Actions : [yaw_change, pitch_change, forward_throttle, sprint]
+        """Apply bounded actions to the game"""
         yaw, pitch = ms.player_orientation()
 
-        # Camera : changements relatifs
-        yaw_change = float(action[0]) * 15.0  # Max 15 degrees per step
-        pitch_change = float(action[1]) * 5.0
+        # Actions are already in [-1, 1] from tanh
+        yaw_change = float(action[0]) * 10.0  # Max 10° per step (reduced)
+        pitch_change = float(action[1]) * 3.0  # Max 3° per step (reduced)
 
         new_yaw = yaw + yaw_change
         new_pitch = np.clip(pitch + pitch_change, -45, 45)
@@ -388,9 +505,8 @@ class SimpleNavigationEnv:
 
         # Movement controls
         throttle = float(action[2])
-        sprint = float(action[3]) > 0.5
+        sprint = float(action[3]) > 0
 
-        # LOG DEBUG
         self.logger.debug(
             f"Actions: Yaw={yaw_change:.1f}° Pitch={pitch_change:.1f}° "
             f"Throttle={throttle:.2f} Sprint={sprint}"
@@ -411,17 +527,17 @@ class SimpleNavigationEnv:
 
 
 # =====================================
-# PPO Agent
+# Improved PPO Agent
 # =====================================
 class SimplePPOAgent:
-    """A minimalist but functional PPO agent."""
+    """PPO agent with improved stability"""
 
     def __init__(self, config: Config, logger=None):
         self.config = config
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.logger = logger if logger else logging.getLogger()
 
-        state_size = 4 + 9
+        state_size = 4 + 9  # 4 base features + 9 hazard scan values
         self.network = SimplePPONetwork(state_size, config.hidden_size).to(self.device)
         self.optimizer = optim.Adam(self.network.parameters(), lr=config.lr)
 
@@ -434,7 +550,7 @@ class SimplePPOAgent:
         self.dones = []
 
     def select_action(self, state):
-        """Selects an action based on the current policy."""
+        """Select action with exploration noise decay"""
         state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
 
         with torch.no_grad():
@@ -447,7 +563,10 @@ class SimplePPOAgent:
         )
 
     def store_transition(self, state, action, reward, log_prob, value, done):
-        """Stores a transition in the buffer."""
+        """Store transition with reward clipping"""
+        # Clip reward before storing to prevent value function explosion
+        reward = np.clip(reward, -2.0, 2.0)
+
         self.states.append(state)
         self.actions.append(action)
         self.rewards.append(reward)
@@ -456,83 +575,102 @@ class SimplePPOAgent:
         self.dones.append(done)
 
     def update(self):
-        """Performs a PPO update with stability protections."""
+        """PPO update with enhanced stability measures"""
         if len(self.states) < self.config.batch_size:
             return
 
-        # LOG
         self.logger.info(f"Network update starting with {len(self.states)} samples")
 
-        # Convert buffers to tensors
+        # Convert to tensors
         states = torch.FloatTensor(np.array(self.states)).to(self.device)
         actions = torch.FloatTensor(np.array(self.actions)).to(self.device)
         old_log_probs = torch.FloatTensor(self.log_probs).to(self.device)
 
-        # Calculate returns and advantages
+        # Compute returns with reward normalization
         returns = self._compute_returns()
-        advantages = returns - torch.FloatTensor(self.values).to(self.device)
 
-        # IMPORTANT: Normalize advantages for stability
+        # CRITICAL: Normalize returns for stability
+        returns_mean = returns.mean()
+        returns_std = returns.std() + 1e-8
+        returns = (returns - returns_mean) / returns_std
+
+        # Compute advantages
+        values_tensor = torch.FloatTensor(self.values).to(self.device)
+        advantages = returns - values_tensor
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
-        # CLIPPING
-        returns = torch.clamp(returns, -100, 100)
-
-        # PPO update loop
+        # PPO optimization loop
         for epoch in range(self.config.ppo_epochs):
             # Forward pass
             mean, std, values = self.network(states)
-            std = torch.clamp(std, 0.01, 1.0)
+
+            # Ensure std stays in reasonable range
+            std = torch.clamp(std, 0.01, 0.5)
+
             dist = Normal(mean, std)
             log_probs = dist.log_prob(actions).sum(dim=-1)
-            ratio = torch.exp(torch.clamp(log_probs - old_log_probs, -10, 10))
 
-            # Clipped surrogate objective
+            # PPO ratio with log space for numerical stability
+            log_ratio = log_probs - old_log_probs
+            ratio = torch.exp(torch.clamp(log_ratio, -5, 5))  # Tighter bounds
+
+            # Surrogate losses
             surr1 = ratio * advantages
-            surr2 = torch.clamp(ratio, 1 - self.config.clip_epsilon, 1 + self.config.clip_epsilon) * advantages
+            surr2 = torch.clamp(ratio,
+                                1 - self.config.clip_epsilon,
+                                1 + self.config.clip_epsilon) * advantages
             actor_loss = -torch.min(surr1, surr2).mean()
 
-            # Critic loss (Huber loss is more robust than MSE)
-            values_clipped = values.squeeze()
-            values_clipped = torch.clamp(values_clipped, -100, 100)
-            critic_loss = F.huber_loss(values_clipped, returns)  # Plus robuste que MSE
+            # Value loss with clipping
+            values_pred = values.squeeze()
+            values_clipped = values_tensor + torch.clamp(
+                values_pred - values_tensor,
+                -self.config.clip_epsilon,
+                self.config.clip_epsilon
+            )
+            value_loss_unclipped = F.mse_loss(values_pred, returns)
+            value_loss_clipped = F.mse_loss(values_clipped, returns)
+            critic_loss = torch.max(value_loss_unclipped, value_loss_clipped)
 
-            # Entropy bonus for exploration
+            # Entropy for exploration
             entropy = dist.entropy().mean()
-            entropy = torch.clamp(entropy, 0, 10)  # Éviter valeurs extrêmes
 
+            # Total loss
             loss = actor_loss + 0.5 * critic_loss - self.config.entropy_beta * entropy
 
+            # Skip update if loss is invalid
             if torch.isnan(loss) or torch.isinf(loss):
-                self.logger.warning(f"Loss invalide détectée: {loss.item()}, skip update")
+                self.logger.warning(f"Invalid loss detected: {loss.item()}, skipping update")
                 continue
 
-            # Gradient update with clipping
+            # Gradient update with strict clipping
             self.optimizer.zero_grad()
             loss.backward()
-            grad_norm = nn.utils.clip_grad_norm_(self.network.parameters(), 1.0)
 
-            # LOG
+            # CRITICAL: Strict gradient clipping
+            grad_norm = nn.utils.clip_grad_norm_(
+                self.network.parameters(),
+                self.config.max_grad_norm
+            )
+
+            # Log gradient information
             self.logger.debug(
                 f"Epoch {epoch + 1}/{self.config.ppo_epochs} | "
                 f"Actor Loss: {actor_loss:.4f} | Critic Loss: {critic_loss:.4f} | "
                 f"Entropy: {entropy:.4f} | Grad Norm: {grad_norm:.3f}"
             )
 
-            # Log si gradients trop grands
-            if grad_norm > 5.0:
-                self.logger.warning(f"Gradient norm élevé: {grad_norm:.2f}")
+            # Warning for high gradients (but they're already clipped)
+            if grad_norm > self.config.max_grad_norm * 0.9:
+                self.logger.warning(f"Gradient norm near limit: {grad_norm:.2f}")
 
             self.optimizer.step()
 
-        # LOG : Fin de mise à jour
-        self.logger.info(f"Network update completed - Final grad norm: {grad_norm:.3f}")
-
-        # Clear buffers
+        self.logger.info("Network update completed")
         self.clear_buffers()
 
     def _compute_returns(self):
-        """Computes discounted returns."""
+        """Compute discounted returns with reward normalization"""
         returns = []
         R = 0
 
@@ -542,9 +680,15 @@ class SimplePPOAgent:
             R = r + self.config.gamma * R
             returns.insert(0, R)
 
-        return torch.FloatTensor(returns).to(self.device)
+        returns_tensor = torch.FloatTensor(returns).to(self.device)
+
+        # Clip returns to prevent extreme values
+        returns_tensor = torch.clamp(returns_tensor, -10, 10)
+
+        return returns_tensor
 
     def clear_buffers(self):
+        """Clear experience buffers"""
         self.states.clear()
         self.actions.clear()
         self.rewards.clear()
@@ -553,7 +697,7 @@ class SimplePPOAgent:
         self.dones.clear()
 
     def save(self, path):
-        """Saves the model weights."""
+        """Save model checkpoint"""
         torch.save({
             'network_state': self.network.state_dict(),
             'optimizer_state': self.optimizer.state_dict()
@@ -561,9 +705,9 @@ class SimplePPOAgent:
         print(f"[SAVE] Model saved to {path}")
 
     def load(self, path):
-        """Loads model weights from a file."""
+        """Load model checkpoint"""
         if os.path.exists(path):
-            checkpoint = torch.load(path, map_location=self.device)
+            checkpoint = torch.load(path, map_location=self.device, weights_only=True)
             self.network.load_state_dict(checkpoint['network_state'])
             self.optimizer.load_state_dict(checkpoint['optimizer_state'])
             print(f"[LOAD] Model loaded from {path}")
@@ -572,10 +716,10 @@ class SimplePPOAgent:
 
 
 # =====================================
-#  Main Training Loop
+# Main Training Loop
 # =====================================
 def train():
-    """Main training function."""
+    """Main training function with improved stability"""
     config = Config()
     logger = setup_logger()
     csv_logger = CSVLogger()
@@ -583,13 +727,14 @@ def train():
     env = SimpleNavigationEnv(config, logger)
     agent = SimplePPOAgent(config, logger)
 
+    # Load existing model if available
     agent.load("simple_ppo_model.pth")
 
     episode_rewards = deque(maxlen=100)
     total_steps = 0
 
     for episode in range(1000):
-        # Progressive difficulty (curriculum learning)
+        # Curriculum learning
         if episode < 200:
             difficulty = "easy"
         elif episode < 500:
@@ -597,20 +742,20 @@ def train():
         else:
             difficulty = "hard"
 
-        # Reset
+        # Reset environment
         state = env.reset(difficulty)
         episode_reward = 0
         steps = 0
 
-        # Episode
+        # Run episode
         while True:
-            # Action
+            # Select action
             action, log_prob, value = agent.select_action(state)
 
-            # Step
+            # Environment step
             next_state, reward, done, info = env.step(action)
 
-            # Store
+            # Store transition
             agent.store_transition(state, action, reward, log_prob, value, done)
 
             # Update counters
@@ -622,7 +767,7 @@ def train():
             # Update network
             if total_steps % config.update_every == 0:
                 agent.update()
-                print(f"[UPDATE] Update networks after {total_steps} steps")
+                logger.info(f"[UPDATE] Network updated after {total_steps} steps")
 
             if done:
                 break
@@ -630,7 +775,7 @@ def train():
         # Log episode
         episode_rewards.append(episode_reward)
 
-        # CSV log
+        # CSV logging
         csv_logger.log_episode({
             'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             'episode': episode,
@@ -641,21 +786,23 @@ def train():
             'start_distance': env.start_distance
         })
 
-        # Print progress
+        # Console output
         if episode % 10 == 0:
             avg_reward = np.mean(episode_rewards)
+            success_rate = sum(1 for r in episode_rewards if r > 5) / len(episode_rewards) * 100
             print(f"\n[Episode {episode}]")
             print(f"  Difficulty: {difficulty}")
-            print(f"  Average Reward (Last 100): {avg_reward:.2f}")
-            print(f"  Last episode: reward={episode_reward:.2f}, steps={steps}, success={info['success']}")
+            print(f"  Avg Reward (100 eps): {avg_reward:.2f}")
+            print(f"  Success Rate: {success_rate:.1f}%")
+            print(f"  Last: reward={episode_reward:.2f}, steps={steps}, success={info['success']}")
 
-        # Save
+        # Save model
         if episode % 50 == 0 and episode > 0:
             agent.save("simple_ppo_model.pth")
 
     # Cleanup
     csv_logger.close()
-    print("\n[TERMINÉ] Training complete!")
+    print("\n[COMPLETE] Training finished!")
 
 
 # =====================================
@@ -663,16 +810,17 @@ def train():
 # =====================================
 if __name__ == "__main__":
     print("=" * 50)
-    print("   SIMPLE PPO - MINECRAFT NAVIGATION")
+    print("   PPO MINECRAFT NAVIGATION - v2.0")
+    print("   With Hazard Detection & Stability Fixes")
     print("=" * 50)
     print("\nStarting training...")
 
     try:
         train()
     except KeyboardInterrupt:
-        print("\nTraining interrupted by user.")
+        print("\n[STOPPED] Training interrupted by user")
     except Exception as e:
-        print(f"\nAn error occurred: {e}")
+        print(f"\n[ERROR] {e}")
         import traceback
 
         traceback.print_exc()
