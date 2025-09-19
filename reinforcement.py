@@ -718,8 +718,10 @@ class SimplePPOAgent:
 # =====================================
 # Main Training Loop
 # =====================================
+best_avg_reward = -float('inf')
 def train():
     """Main training function with improved stability"""
+    global best_avg_reward
     config = Config()
     logger = setup_logger()
     csv_logger = CSVLogger()
@@ -786,6 +788,7 @@ def train():
             'start_distance': env.start_distance
         })
 
+        episode_rewards.append(episode_reward)
         # Console output
         if episode % 10 == 0:
             avg_reward = np.mean(episode_rewards)
@@ -795,10 +798,14 @@ def train():
             print(f"  Avg Reward (100 eps): {avg_reward:.2f}")
             print(f"  Success Rate: {success_rate:.1f}%")
             print(f"  Last: reward={episode_reward:.2f}, steps={steps}, success={info['success']}")
+            if avg_reward > best_avg_reward and len(episode_rewards) >= 100:  # On attend d'avoir assez de données
+                best_avg_reward = avg_reward
+                agent.save("best_model.pth")  # Sauvegarde dans un fichier séparé
+                print(f"[SAVE] New best model saved with avg reward: {avg_reward:.2f}")
 
         # Save model
         if episode % 50 == 0 and episode > 0:
-            agent.save("simple_ppo_model.pth")
+            agent.save("checkpoint_model.pth")
 
     # Cleanup
     csv_logger.close()
